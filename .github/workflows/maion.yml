@@ -1,0 +1,113 @@
+name: Windows 11 RDP RunPod + Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create-windows-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3-pip curl
+          pip3 install pywinrm
+
+      - name: Generate Random Admin Password
+        id: genpass
+        run: |
+          PASSWORD=$(openssl rand -base64 16)
+          echo "PASSWORD=$PASSWORD" >> $GITHUB_ENV
+          echo "Generated password for user runneradmin"
+
+      - name: Create Windows 11 Pod on RunPod
+        run: |
+          POD_NAME="win11-${GITHUB_RUN_ID}"
+          echo "Creating Windows 11 pod $POD_NAME..."
+          CREATE=$(curl -s -X POST "https://api.runpod.io/v1/pods" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"podName\": \"$POD_NAME\",
+              \"image\": \"windows-11-64bit\",
+              \"cpu\": 4,
+              \"ram\": 32,
+              \"storage\": 1024,
+              \"autoStart\": true,
+              \"env\": {
+                \"USERNAME\": \"runneradmin\",
+                \"PASSWORD\": \"$PASSWORD\"
+              }
+            }")
+          echo "Pod create response: $CREATE"
+          POD_ID=$(echo $CREATE | jq -r '.id')
+          echo "POD_ID=$POD_ID" >> $GITHUB_ENV
+
+      - name: Wait for Pod IP
+        run: |
+          echo "Waiting for pod IP..."
+          for i in {1..30}; do
+            IP=$(curl -s -X GET "https://api.runpod.io/v1/pods/$POD_ID" \
+              -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" | jq -r '.ip')
+            if [ "$IP" != "null" ]; then
+              echo "Pod IP: $IP"
+              echo "POD_IP=$IP" >> $GITHUB_ENV
+              break
+            fi
+            echo "[$i] Waiting 10s..."
+            sleep 10
+          done
+
+      - name: Display RDP Access Info
+        run: |
+          echo "=========================="
+          echo "RDP Pod is ready"
+          echo "IP Address: $POD_IP"
+          echo "Username: runneradmin"
+          echo "Password: $PASSWORD"
+          echo "=========================="
+          echo "Manual acceptance of Administrator rights may be required"
+          echo "RDP + Tailscale session active for 6 hours"
+
+      - name: Install Tailscale via WinRM
+        run: |
+          WINSERVER=$POD_IP
+          ADMIN_USER="runneradmin"
+          ADMIN_PASS=$PASSWORD
+
+          cat <<'EOF' > install_tailscale.ps1
+$tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+$installerPath = "$env:TEMP\tailscale.msi"
+Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+Remove-Item $installerPath -Force
+& "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="gh-runner-${GITHUB_RUN_ID}"
+EOF
+
+          python3 - <<PYTHON
+import winrm, os
+session = winrm.Session('$WINSERVER', auth=('runneradmin', os.environ['PASSWORD']))
+with open('install_tailscale.ps1', 'r') as f:
+    ps_script = f.read()
+r = session.run_ps(ps_script)
+print(r.std_out.decode())
+print(r.std_err.decode())
+PYTHON
+
+      - name: Keep RDP Active 6 Hours
+        run: |
+          for i in {1..72}; do
+            echo "[$(date)] RDP + Tailscale active - waiting..."
+            sleep 300
+          done
+
+      - name: Shutdown Pod
+        run: |
+          echo "Shutting down pod $POD_ID ..."
+          curl -X POST "https://api.runpod.io/v1/pods/$POD_ID/actions" \
+            -H "Authorization: Bearer ${{ secrets.RUNPOD_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"action":"stop"}'
+            
